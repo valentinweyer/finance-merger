@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.venv/
+venv/
+ENV/
+env/
+*.env
+
+# macOS system files
+.DS_Store
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# VS Code settings
+.vscode/
+
+# Output files
+*.csv
+*.xlsx
+*.xls
+*.pdf
+*.log
+
+# Ignore backup or temp files
+*.bak
+*.tmp
+*.swp
+*~
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
