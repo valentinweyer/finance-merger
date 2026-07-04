@@ -1,36 +1,97 @@
 import pandas as pd
 import chardet
 import csv
+from pandas.errors import EmptyDataError
+from typing import Iterable
 
 
 def detect_encoding(file_path, sample_size=10000):
-    """Detect file encoding using chardet"""
+    """Detect file encoding using chardet."""
     with open(file_path, 'rb') as f:
-        raw_data = f.read(sample_size)  # Read a small sample of the file
-    return chardet.detect(raw_data)['encoding']
+        raw_data = f.read(sample_size)
+    result = chardet.detect(raw_data)
+    return result.get('encoding'), result.get('confidence', 0.0)
 
-def merge_financing_files(bank_account_path, credit_card_path, output_file_path, *args):
+
+def read_csv_with_fallback(file_path, sep=";", detected_encoding=None, fallback_encodings: Iterable[str] | None = None, empty_ok: bool = False, **kwargs):
+    """Read a CSV with fallback encodings instead of trusting chardet blindly."""
+    if fallback_encodings is None:
+        fallback_encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1", "iso-8859-1", "cp1250"]
+
+    encodings_to_try = []
+    if detected_encoding:
+        encodings_to_try.append(detected_encoding)
+    encodings_to_try.extend(fallback_encodings)
+
+    # Remove duplicates while preserving order
+    encodings_to_try = list(dict.fromkeys(encodings_to_try))
+
+    last_error = None
+    for encoding in encodings_to_try:
+        try:
+            df = pd.read_csv(file_path, sep=sep, encoding=encoding, **kwargs)
+            print(f"Successfully read {file_path} with encoding: {encoding}")
+            return df, encoding
+        except UnicodeDecodeError as exc:
+            print(f"Failed reading {file_path} with encoding {encoding}: {exc}")
+            last_error = exc
+        except EmptyDataError:
+            print(f"File is empty or has no columns: {file_path}")
+            if empty_ok:
+                return pd.DataFrame(), encoding
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError(f"Could not decode file: {file_path}")
+
+def merge_financing_files(bank_account_path, credit_card_path, output_file_path, paypal_path=None):
     # 🔍 Detect encoding of the bank account file
-    bank_encoding = detect_encoding(bank_account_path)
-    print(f"Detected encoding for bank account file: {bank_encoding}")
+    bank_encoding, bank_confidence = detect_encoding(bank_account_path)
+    print(f"Detected encoding for bank account file: {bank_encoding} (confidence: {bank_confidence})")
 
     # 🔍 Detect encoding of the credit card file
-    credit_card_encoding = detect_encoding(credit_card_path)
-    print(f"Detected encoding for credit card file: {credit_card_encoding}")
+    credit_card_encoding, credit_card_confidence = detect_encoding(credit_card_path)
+    print(f"Detected encoding for credit card file: {credit_card_encoding} (confidence: {credit_card_confidence})")
 
-    # Read CSV files using the detected encoding
-    bank_account_df = pd.read_csv(bank_account_path, sep=";", encoding=bank_encoding, on_bad_lines='skip', engine='python')
-    credit_card_df = pd.read_csv(credit_card_path, sep=";", encoding=credit_card_encoding, on_bad_lines='skip', engine='python')
-    paypal_df = pd.read_csv(paypal_path, sep=",", encoding="utf-8-sig", on_bad_lines='skip', engine='python')
+    # Read CSV files using detected encoding as a hint, with robust fallbacks
+    bank_account_df, bank_used_encoding = read_csv_with_fallback(
+        bank_account_path,
+        sep=";",
+        detected_encoding=bank_encoding,
+        on_bad_lines='skip',
+        engine='python'
+    )
+    credit_card_df, credit_card_used_encoding = read_csv_with_fallback(
+        credit_card_path,
+        sep=";",
+        detected_encoding=credit_card_encoding,
+        on_bad_lines='skip',
+        engine='python'
+    )
+    print(f"Final encoding used for bank account file: {bank_used_encoding}")
+    print(f"Final encoding used for credit card file: {credit_card_used_encoding}")
 
-    if(paypal_path):
-        paypal_df = pd.read_csv(paypal_path, sep=",", encoding='utf-8-sig', on_bad_lines='skip', engine='python')
-        # Strip any remaining whitespace from all column headers
-        paypal_df.columns = paypal_df.columns.str.strip()
-        # Check PayPal columns after cleaning to confirm the "Date" column is correct
-        print("PayPal columns after cleaning:", paypal_df.columns)
-    else:
-        paypal_df = pd.DataFrame()
+    paypal_df = pd.DataFrame()
+    if paypal_path:
+        try:
+            paypal_df, paypal_used_encoding = read_csv_with_fallback(
+                paypal_path,
+                sep=",",
+                detected_encoding="utf-8-sig",
+                on_bad_lines="skip",
+                engine="python",
+                empty_ok=True
+            )
+            if not paypal_df.empty:
+                paypal_df.columns = paypal_df.columns.str.strip()
+                print(f"Final encoding used for PayPal file: {paypal_used_encoding}")
+                print("PayPal columns after cleaning:", list(paypal_df.columns))
+            else:
+                print(f"PayPal file is empty: {paypal_path}")
+        except EmptyDataError:
+            print(f"PayPal file is empty and will be ignored: {paypal_path}")
+            paypal_df = pd.DataFrame()
     
 
     # Convert monetary columns from comma to point format
@@ -54,38 +115,42 @@ def merge_financing_files(bank_account_path, credit_card_path, output_file_path,
         credit_card_df['Buchungsdatum'] = pd.to_datetime(credit_card_df['Buchungsdatum'], format='%d.%m.%y', errors='coerce').dt.strftime('%Y-%m-%d')
 
     # Map columns to the unified structure
-    bank_account_output = pd.DataFrame({
-        'Belegdatum': bank_account_df.get('Buchungstag', pd.NA), 
-        'Transaktionsdatum': bank_account_df.get('Valutadatum', pd.NA),
-        'Buchungsbetrag': bank_account_df.get('Betrag', pd.NA),
-        'Transaktionspartner': bank_account_df.get('Beguenstigter/Zahlungspflichtiger', pd.NA),
-        'Beschreibung': bank_account_df.get('Verwendungszweck', pd.NA),
-        'IBAN': bank_account_df.get('Kontonummer/IBAN', pd.NA),
-        'BIC': bank_account_df.get('BIC (SWIFT-Code)', pd.NA),
-        'Kategorie': bank_account_df.get('Kategorie', pd.NA),
-    })
+    def series_or_na(df: pd.DataFrame, col: str) -> pd.Series:
+        """Return a Series aligned to df.index; if col missing, return NA Series of same length."""
+        if col in df.columns:
+            return df[col]
+        return pd.Series([pd.NA] * len(df), index=df.index)
 
-    credit_card_output = pd.DataFrame({
-        'Belegdatum': credit_card_df.get('Belegdatum', pd.NA),
-        'Transaktionsdatum': credit_card_df.get('Buchungsdatum', pd.NA),
-        'Buchungsbetrag': credit_card_df.get('Buchungsbetrag', pd.NA),
-        'Transaktionspartner': credit_card_df.get('Transaktionsbeschreibung', pd.NA),
-        'Beschreibung': credit_card_df.get('Transaktionsbeschreibung Zusatz', pd.NA),
-        'IBAN': pd.NA,
-        'BIC': pd.NA,
-        'Kategorie': pd.NA
-    })
-    if paypal_path:
-        paypal_output = pd.DataFrame({
-            'Belegdatum': paypal_df.get('Date', pd.NA),
-            'Transaktionsdatum': paypal_df.get('Date', pd.NA),
-            'Buchungsbetrag': paypal_df.get('Gross', pd.NA),
-            'Transaktionspartner': paypal_df.get('Name', pd.NA),
-            'Beschreibung': paypal_df.get('Subject', pd.NA),
-            'IBAN': pd.NA,
-            'BIC': pd.NA,
-            'Kategorie': pd.NA
-        })
+    bank_account_output = pd.DataFrame(index=bank_account_df.index)
+    bank_account_output["Belegdatum"] = series_or_na(bank_account_df, "Buchungstag")
+    bank_account_output["Transaktionsdatum"] = series_or_na(bank_account_df, "Valutadatum")
+    bank_account_output["Buchungsbetrag"] = series_or_na(bank_account_df, "Betrag")
+    bank_account_output["Transaktionspartner"] = series_or_na(bank_account_df, "Beguenstigter/Zahlungspflichtiger")
+    bank_account_output["Beschreibung"] = series_or_na(bank_account_df, "Verwendungszweck")
+    bank_account_output["IBAN"] = series_or_na(bank_account_df, "Kontonummer/IBAN")
+    bank_account_output["BIC"] = series_or_na(bank_account_df, "BIC (SWIFT-Code)")
+    bank_account_output["Kategorie"] = series_or_na(bank_account_df, "Kategorie")
+
+    credit_card_output = pd.DataFrame(index=credit_card_df.index)
+    credit_card_output["Belegdatum"] = series_or_na(credit_card_df, "Belegdatum")
+    credit_card_output["Transaktionsdatum"] = series_or_na(credit_card_df, "Buchungsdatum")
+    credit_card_output["Buchungsbetrag"] = series_or_na(credit_card_df, "Buchungsbetrag")
+    credit_card_output["Transaktionspartner"] = series_or_na(credit_card_df, "Transaktionsbeschreibung")
+    credit_card_output["Beschreibung"] = series_or_na(credit_card_df, "Transaktionsbeschreibung Zusatz")
+    credit_card_output["IBAN"] = pd.NA
+    credit_card_output["BIC"] = pd.NA
+    credit_card_output["Kategorie"] = pd.NA
+
+    if paypal_path and not paypal_df.empty:
+        paypal_output = pd.DataFrame(index=paypal_df.index)
+        paypal_output["Belegdatum"] = series_or_na(paypal_df, "Date")
+        paypal_output["Transaktionsdatum"] = series_or_na(paypal_df, "Date")
+        paypal_output["Buchungsbetrag"] = series_or_na(paypal_df, "Gross")
+        paypal_output["Transaktionspartner"] = series_or_na(paypal_df, "Name")
+        paypal_output["Beschreibung"] = series_or_na(paypal_df, "Subject")
+        paypal_output["IBAN"] = pd.NA
+        paypal_output["BIC"] = pd.NA
+        paypal_output["Kategorie"] = pd.NA
     else:
         paypal_output = pd.DataFrame()
 
@@ -108,14 +173,25 @@ def merge_latest_files(latest_file_path, last_latest_file_path, output_file_path
     """ Merges two files and sorts them by date. """
     def detect_delimiter(file_path):
         with open(file_path, "r", encoding="ISO-8859-1") as f:
-            first_line = f.readline()
+            first_line = f.readline().strip()
+        if not first_line:
+            return ";"
         return "," if "," in first_line else ";"
 
     latest_delimiter = detect_delimiter(latest_file_path)
     last_latest_delimiter = detect_delimiter(last_latest_file_path)
 
-    latest_df = pd.read_csv(latest_file_path, sep=latest_delimiter, encoding="ISO-8859-1")
-    last_latest_df = pd.read_csv(last_latest_file_path, sep=last_latest_delimiter, encoding="ISO-8859-1")
+    try:
+        latest_df = pd.read_csv(latest_file_path, sep=latest_delimiter, encoding="ISO-8859-1")
+    except EmptyDataError:
+        print(f"Latest file is empty: {latest_file_path}")
+        latest_df = pd.DataFrame(columns=["Belegdatum", "Transaktionsdatum", "Buchungsbetrag", "Beschreibung", "Transaktionspartner", "IBAN", "BIC", "Kategorie"])
+
+    try:
+        last_latest_df = pd.read_csv(last_latest_file_path, sep=last_latest_delimiter, encoding="ISO-8859-1")
+    except EmptyDataError:
+        print(f"Previous merged file is empty: {last_latest_file_path}")
+        last_latest_df = pd.DataFrame(columns=["Belegdatum", "Transaktionsdatum", "Buchungsbetrag", "Beschreibung", "Transaktionspartner", "IBAN", "BIC", "Kategorie"])
 
     latest_df = clean_dataframe(latest_df)
     last_latest_df = clean_dataframe(last_latest_df)
@@ -247,31 +323,32 @@ def summarize_transactions_by_month_filtered(input_file, output_monthly_summary_
 
 
 
-root_folder = "/Users/valentinweyer/Library/CloudStorage/Dropbox/Valentin/Projekte/Finance_Tracker/Files/"
+root_folder = "/Users/valentinweyer/Dropbox/Valentin/Projekte/Finance_Tracker/Files/"
 #latest_file = f"{root_folder}/merged_final_06_04_2025.csv"
 
-bank_account_path = f"{root_folder}Konto_Stand_10_07_2025.CSV"
-credit_card_path = f"{root_folder}Karte_Stand_10_07_2025.CSV"
+bank_account_path = f"{root_folder}Konto_Stand_04_07_2026.CSV"
+credit_card_path = f"{root_folder}Karte_Stand_04_07_2026.CSV"
 paypal_path = f"{root_folder}Download.CSV"
-output_file_path = f"{root_folder}merged_10_06_2025.csv"
+output_file_path = f"{root_folder}merged_04_07_2026.csv"
 
-last_latest_file = f"{root_folder}/merged_02_06_2025.csv"
+last_latest_file = f"{root_folder}merged_15_06_2026.csv"
 
 
 
 def merge(bank_account_path, credit_card_path, root_folder_path, last_latest_file_path, output_file_path):
-    merge_financing_files(bank_account_path, credit_card_path, output_file_path)
+    merge_financing_files(bank_account_path, credit_card_path, output_file_path, paypal_path=paypal_path)
     merge_latest_files(output_file_path, last_latest_file_path, output_file_path)
 
 
 
 merge(bank_account_path, credit_card_path, root_folder, last_latest_file, output_file_path)
 
+#user now manually fills in the categories in the merged file, then we can summarize by month and category
 
-categories_to_include = ["Lebensmittel", "Internet", "Strom", "Wasser", "Bildung", "Transport"]
-output_monthly_summary_file = root_folder + "/monthly_summary_06_04_2025.csv"
+categories_to_include = ["Lebensmittel", "Internet", "Strom", "Wasser", "Bildung", "Transport", "Hotel"]
+output_monthly_summary_file = root_folder + "monthly_summary_04_07_2026.csv"
 
 summarize_transactions_by_month_filtered(output_file_path, output_monthly_summary_file, categories_to_include)
-#summarize_by_month_and_category(output_file_path, output_monthly_summary_file, categories_to_include)
+summarize_by_month_and_category(output_file_path, root_folder + "monthly_summary_categories_04_07_2026.csv", categories_to_include)
 
 
