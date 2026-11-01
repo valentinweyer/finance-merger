@@ -1,8 +1,75 @@
+"""
+Finance Tracker combiner
+=========================
+
+Merges bank, credit card, and (optionally) PayPal CSV exports into a single
+running ledger, then produces monthly spending summaries.
+
+How to use
+----------
+1. Export your statements and drop them into the "Files/incoming" folder
+   (next to this script), using these filenames:
+     - Bank account:  Konto_Stand_DD_MM_YYYY.CSV
+     - Credit card:   Karte_Stand_DD_MM_YYYY.CSV
+     - PayPal:        Download.CSV (or Download*.csv)
+   If multiple bank/credit-card files are present, the one with the newest
+   date in its filename is used. PayPal export isn't required.
+
+2. Run the script from a terminal:
+     python "Finance Tracker combiner.py"
+
+3. What it does:
+     - Reads the latest bank + credit card (+ PayPal) exports.
+     - Normalizes columns/dates/amounts into a common format.
+     - Merges the new transactions into "Files/ledger.csv", removing
+       duplicates (matched on date + amount) so re-running is safe.
+     - Backs up the previous ledger to "Files/backups/" before overwriting.
+     - Writes two summary files:
+         - Files/monthly_summary.csv            (total per month)
+         - Files/monthly_summary_categories.csv (total per month per category)
+       Only categories listed in CATEGORIES_TO_INCLUDE are summarized, and
+       amounts in SHARED_CATEGORIES (e.g. shared utility bills) are halved.
+
+4. Categorizing transactions:
+     Blank "Kategorie" cells are filled automatically when the same
+     Transaktionspartner was labeled at least AUTO_CATEGORIZE_MIN_MATCHES
+     times, always with the same category (the run prints each fill).
+     Open "Files/ledger.csv" and fill in the "Kategorie" column for any rows
+     that are still blank (the script tells you how many are missing after
+     each run). Re-run the script afterwards to refresh the summaries with the
+     newly categorized rows.
+
+Folder layout (auto-created under "Files/"):
+     incoming/  - drop new bank/card/PayPal exports here
+     archive/   - optional: old merged_*.csv files used to seed a fresh ledger
+     backups/   - automatic timestamped backups of ledger.csv
+     ledger.csv - the running, deduplicated transaction ledger
+"""
+
 import pandas as pd
 import chardet
 import csv
+import re
+import shutil
+from datetime import datetime
+from pathlib import Path
 from pandas.errors import EmptyDataError
 from typing import Iterable
+
+FILES_DIR = Path(__file__).resolve().parent / "Files"
+INCOMING_DIR = FILES_DIR / "incoming"
+ARCHIVE_DIR = FILES_DIR / "archive"
+LEDGER_PATH = FILES_DIR / "ledger.csv"
+BACKUPS_DIR = FILES_DIR / "backups"
+
+DATE_REGEX = r"(\d{2})_(\d{2})_(\d{4})"
+DATE_FORMAT = "%d_%m_%Y"
+
+CATEGORIES_TO_INCLUDE = ["Lebensmittel", "Internet", "Strom", "Wasser", "Bildung", "Transport", "Hotel"]
+SHARED_CATEGORIES = []
+
+# A partner's category is reused only after it was labeled this many times, always the same way
+AUTO_CATEGORIZE_MIN_MATCHES = 3
 
 
 def detect_encoding(file_path, sample_size=10000):
@@ -221,6 +288,35 @@ def merge_latest_files(latest_file_path, last_latest_file_path, output_file_path
     merged_df.to_csv(output_file_path, sep=";", index=False, encoding="ISO-8859-1")
     print(f"✅ Merged and sorted file saved to {output_file_path}")
 
+def auto_categorize(ledger_path, min_matches=AUTO_CATEGORIZE_MIN_MATCHES):
+    """
+    Fills blank 'Kategorie' cells from the same Transaktionspartner's earlier labels.
+    Partners with fewer than min_matches labels, or with conflicting labels, stay blank.
+    """
+    df = pd.read_csv(ledger_path, sep=";", encoding="ISO-8859-1", dtype=str, keep_default_na=False)
+    partner = df["Transaktionspartner"].str.strip()
+    category = df["Kategorie"].str.strip()
+
+    # Empty partners ("" or "nan" from clean_dataframe) would lump unrelated rows together
+    has_partner = ~partner.isin(["", "nan"])
+    labeled = has_partner & category.ne("")
+    stats = category[labeled].groupby(partner[labeled]).agg(["nunique", "size", "first"])
+    rules = stats.loc[(stats["nunique"] == 1) & (stats["size"] >= min_matches), "first"]
+
+    to_fill = has_partner & category.eq("") & partner.isin(rules.index)
+    if not to_fill.any():
+        print("Auto-categorize: no blank rows matched a known partner.")
+        return 0
+
+    df.loc[to_fill, "Kategorie"] = partner[to_fill].map(rules)
+    df.to_csv(ledger_path, sep=";", index=False, encoding="ISO-8859-1")
+
+    filled = df[to_fill].groupby(["Transaktionspartner", "Kategorie"]).size()
+    print(f"Auto-categorized {to_fill.sum()} rows from partners labeled at least {min_matches}x:")
+    for (name, cat), count in filled.items():
+        print(f"  {count:>3}x  {name} -> {cat}")
+    return int(to_fill.sum())
+
 def summarize_by_month_and_category(input_file, output_file, categories_to_include):
     """
     Summarizes transactions by month and category, halves shared categories, and saves the breakdown.
@@ -246,12 +342,9 @@ def summarize_by_month_and_category(input_file, output_file, categories_to_inclu
     # Filter by included categories
     df_filtered = df[df["Kategorie"].isin(categories_to_include)].copy()
 
-    # Define shared categories to divide by 2
-    shared_categories = ["Strom", "Wasser", "Internet"]
-
     # Adjust values for shared categories
     df_filtered["Betrag_adjusted"] = df_filtered.apply(
-        lambda row: row["Buchungsbetrag"] / 2 if row["Kategorie"] in shared_categories else row["Buchungsbetrag"],
+        lambda row: row["Buchungsbetrag"] / 2 if row["Kategorie"] in SHARED_CATEGORIES else row["Buchungsbetrag"],
         axis=1
     )
 
@@ -301,12 +394,9 @@ def summarize_transactions_by_month_filtered(input_file, output_monthly_summary_
     # Filter categories
     df_filtered = df[df["Kategorie"].isin(categories_to_include)].copy()
 
-    # Define shared-cost categories
-    shared_categories = ["Strom", "Wasser", "Internet"]
-
     # Adjust shared costs
     df_filtered["Buchungsbetrag_adjusted"] = df_filtered.apply(
-        lambda row: row["Buchungsbetrag"] / 2 if row["Kategorie"] in shared_categories else row["Buchungsbetrag"],
+        lambda row: row["Buchungsbetrag"] / 2 if row["Kategorie"] in SHARED_CATEGORIES else row["Buchungsbetrag"],
         axis=1
     )
 
@@ -323,32 +413,96 @@ def summarize_transactions_by_month_filtered(input_file, output_monthly_summary_
 
 
 
-root_folder = "/Users/valentinweyer/Dropbox/Valentin/Projekte/Finance_Tracker/Files/"
-#latest_file = f"{root_folder}/merged_final_06_04_2025.csv"
+def latest_file_by_date(directory: Path, glob_pattern: str, exclude: Path | None = None) -> Path | None:
+    """Return the file matching glob_pattern whose filename encodes the newest DD_MM_YYYY date."""
+    candidates = []
+    for path in directory.glob(glob_pattern):
+        if exclude is not None and path.resolve() == exclude.resolve():
+            continue
+        match = re.search(DATE_REGEX, path.name)
+        if not match:
+            continue
+        try:
+            date = datetime.strptime(match.group(0), DATE_FORMAT)
+        except ValueError:
+            continue
+        candidates.append((date, path))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
-bank_account_path = f"{root_folder}Konto_Stand_04_07_2026.CSV"
-credit_card_path = f"{root_folder}Karte_Stand_04_07_2026.CSV"
-paypal_path = f"{root_folder}Download.CSV"
-output_file_path = f"{root_folder}merged_04_07_2026.csv"
 
-last_latest_file = f"{root_folder}merged_15_06_2026.csv"
+def find_paypal_file(directory: Path) -> Path | None:
+    """PayPal exports aren't date-stamped; use Download.CSV, or the newest Download*.csv if several exist."""
+    exact = directory / "Download.CSV"
+    if exact.exists():
+        return exact
+    candidates = list(directory.glob("Download*.csv")) + list(directory.glob("Download*.CSV"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-
-def merge(bank_account_path, credit_card_path, root_folder_path, last_latest_file_path, output_file_path):
+def merge(bank_account_path, credit_card_path, output_file_path, paypal_path=None):
     merge_financing_files(bank_account_path, credit_card_path, output_file_path, paypal_path=paypal_path)
-    merge_latest_files(output_file_path, last_latest_file_path, output_file_path)
 
 
+def run():
+    INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
-merge(bank_account_path, credit_card_path, root_folder, last_latest_file, output_file_path)
+    bank_account_path = latest_file_by_date(INCOMING_DIR, "Konto_Stand_*.CSV")
+    credit_card_path = latest_file_by_date(INCOMING_DIR, "Karte_Stand_*.CSV")
+    paypal_path = find_paypal_file(INCOMING_DIR)
 
-#user now manually fills in the categories in the merged file, then we can summarize by month and category
+    if bank_account_path is None or credit_card_path is None:
+        print(f"Could not find both a Konto_Stand_*.CSV and Karte_Stand_*.CSV export in {INCOMING_DIR}. Nothing to do.")
+        return
 
-categories_to_include = ["Lebensmittel", "Internet", "Strom", "Wasser", "Bildung", "Transport", "Hotel"]
-output_monthly_summary_file = root_folder + "monthly_summary_04_07_2026.csv"
+    print(f"Using bank export: {bank_account_path.name}")
+    print(f"Using credit card export: {credit_card_path.name}")
+    print(f"Using PayPal export: {paypal_path.name if paypal_path else '(none found)'}")
 
-summarize_transactions_by_month_filtered(output_file_path, output_monthly_summary_file, categories_to_include)
-summarize_by_month_and_category(output_file_path, root_folder + "monthly_summary_categories_04_07_2026.csv", categories_to_include)
+    ledger_exists = LEDGER_PATH.exists()
+    if ledger_exists:
+        BACKUPS_DIR.mkdir(exist_ok=True)
+        backup_path = BACKUPS_DIR / f"ledger_{datetime.now().strftime('%d_%m_%Y_%H%M')}.csv"
+        shutil.copy2(LEDGER_PATH, backup_path)
+        print(f"Backed up existing ledger to {backup_path}")
+    else:
+        seed_path = latest_file_by_date(ARCHIVE_DIR, "merged_*.csv")
+        if seed_path is not None:
+            shutil.copy2(seed_path, LEDGER_PATH)
+            print(f"Seeded ledger from {seed_path.name}")
+
+    freshly_merged_path = FILES_DIR / "_new_export_merge.csv"
+    merge(bank_account_path, credit_card_path, freshly_merged_path, paypal_path=paypal_path)
+
+    if LEDGER_PATH.exists():
+        merge_latest_files(freshly_merged_path, LEDGER_PATH, LEDGER_PATH)
+    else:
+        merged_df = clean_dataframe(pd.read_csv(freshly_merged_path, sep=","))
+        merged_df.to_csv(LEDGER_PATH, sep=";", index=False, encoding="ISO-8859-1")
+        print(f"Created new ledger at {LEDGER_PATH}")
+    freshly_merged_path.unlink(missing_ok=True)
+
+    auto_categorize(LEDGER_PATH)
+
+    ledger_df = pd.read_csv(LEDGER_PATH, sep=";", encoding="ISO-8859-1")
+    uncategorized = ledger_df["Kategorie"].isna().sum()
+
+    summary_path = FILES_DIR / "monthly_summary.csv"
+    summary_by_category_path = FILES_DIR / "monthly_summary_categories.csv"
+    summarize_transactions_by_month_filtered(LEDGER_PATH, summary_path, CATEGORIES_TO_INCLUDE)
+    summarize_by_month_and_category(LEDGER_PATH, summary_by_category_path, CATEGORIES_TO_INCLUDE)
+
+    print(f"\n{len(ledger_df)} total transactions in ledger, {uncategorized} without a Kategorie.")
+    if uncategorized:
+        print(f"Fill in 'Kategorie' for the missing rows in {LEDGER_PATH}, then re-run to refresh the summaries.")
+    print(f"Summaries written to {summary_path.name} and {summary_by_category_path.name}")
+
+
+if __name__ == "__main__":
+    run()
 
 
