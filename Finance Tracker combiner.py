@@ -350,6 +350,8 @@ def summarize_by_month_and_category(input_file, output_file, categories_to_inclu
 
     # Group by month and category
     breakdown = df_filtered.groupby(["Jahr-Monat", "Kategorie"])["Betrag_adjusted"].sum().reset_index()
+    # Round away float summation noise (e.g. -339.53000000000003)
+    breakdown["Betrag_adjusted"] = breakdown["Betrag_adjusted"].round(2)
 
     # Sort by date and category
     breakdown = breakdown.sort_values(by=["Jahr-Monat", "Kategorie"], ascending=[False, True])
@@ -402,6 +404,8 @@ def summarize_transactions_by_month_filtered(input_file, output_monthly_summary_
 
     # Group by month and sum
     monthly_summary = df_filtered.groupby("Jahr-Monat")["Buchungsbetrag_adjusted"].sum().reset_index()
+    # Round away float summation noise (e.g. -339.53000000000003)
+    monthly_summary["Buchungsbetrag_adjusted"] = monthly_summary["Buchungsbetrag_adjusted"].round(2)
     monthly_summary = monthly_summary.sort_values(by="Jahr-Monat", ascending=False)
 
     # Save and print
