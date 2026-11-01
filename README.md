@@ -20,8 +20,9 @@ Supports **category filtering**, **shared cost handling**, and **monthly summari
 
 ## 📦 Requirements
 
-- Python 3.8+
-- `pandas`
+- [uv](https://docs.astral.sh/uv/) (installs Python 3.12+, `pandas` and `chardet` from `pyproject.toml`)
 
 ```bash
-pip install pandas
+uv sync
+uv run "Finance Tracker combiner.py"
+```

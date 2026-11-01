@@ -1,0 +1,8 @@
+[project]
+name = "finance-tracker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "chardet>=7.7.0",
+    "pandas>=3.1.0",
+]
